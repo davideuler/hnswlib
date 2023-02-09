@@ -1,6 +1,37 @@
 #include "../../hnswlib/hnswlib.h"
 #include <thread>
 
+#include <chrono>
+#include <ctime>
+#include <string>
+#include <iostream>
+
+#ifdef _WIN32
+#include <io.h>
+   #define access    _access_s
+#else
+#include <unistd.h>
+#endif
+
+#include <sys/stat.h>
+
+using namespace std::literals::string_literals;
+
+int exist(const char *name)
+{
+    struct stat   buffer;
+    return (stat (name, &buffer) == 0);
+}
+
+template <
+        class result_t   = std::chrono::milliseconds,
+        class clock_t    = std::chrono::steady_clock,
+        class duration_t = std::chrono::milliseconds
+>
+auto since(std::chrono::time_point<clock_t, duration_t> const& start)
+{
+    return std::chrono::duration_cast<result_t>(clock_t::now() - start);
+}
 
 // Multithreaded executor
 // The helper function copied from python_bindings/bindings.cpp (and that itself is copied from nmslib)
@@ -74,16 +105,16 @@ unsigned int divisor = 1;
 
 
 int main() {
-    int dim = 16;               // Dimension of the elements
-    int max_elements = 10000;   // Maximum number of elements, should be known beforehand
-    int M = 16;                 // Tightly connected with internal dimensionality of the data
+    int dim = 128;               // Dimension of the elements
+    int max_elements = 500000;   // Maximum number of elements, should be known beforehand
+    int M = 32;                 // Tightly connected with internal dimensionality of the data
                                 // strongly affects the memory consumption
-    int ef_construction = 200;  // Controls index search speed/build speed tradeoff
+    int ef_construction = 500;  // Controls index search speed/build speed tradeoff
     int num_threads = 20;       // Number of threads for operations with index
-
-    // Initing index
     hnswlib::L2Space space(dim);
-    hnswlib::HierarchicalNSW<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, max_elements, M, ef_construction);
+
+    std::string hnsw_path =  "hnsw_mt_";
+    hnsw_path += std::to_string(M) + "_"s + std::to_string(ef_construction) + "_"s + std::to_string(max_elements)  + ".bin"s;
 
     // Generate random data
     std::mt19937 rng;
@@ -94,29 +125,69 @@ int main() {
         data[i] = distrib_real(rng);
     }
 
-    // Add data to index
-    ParallelFor(0, max_elements, num_threads, [&](size_t row, size_t threadId) {
-        alg_hnsw->addPoint((void*)(data + dim * row), row);
-    });
+    if(!exist(hnsw_path.c_str())){
+        // Initing index
+        hnswlib::HierarchicalNSW<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, max_elements, M, ef_construction);
+
+        auto timenow = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "starting build index, total elements:" << max_elements << " at " << ctime(&timenow) << std::endl;
+        auto start = std::chrono::steady_clock::now();
+
+        // Add data to index
+        ParallelFor(0, max_elements, num_threads, [&](size_t row, size_t threadId) {
+            alg_hnsw->addPoint((void*)(data + dim * row), row);
+        });
+
+        std::cout << "Index duration elapsed(ms)=" << since(start).count() << " docs:" << max_elements  << std::endl;
+
+        // Serialize index
+        alg_hnsw->saveIndex(hnsw_path);
+        delete alg_hnsw;
+    }
+
+    // Deserialize index and check recall
+    hnswlib::HierarchicalNSW<float>* alg_hnsw = new hnswlib::HierarchicalNSW<float>(&space, hnsw_path);
+    alg_hnsw->setEf(512);
 
     // Create filter that allows only even labels
     PickDivisibleIds pickIdsDivisibleByTwo(2);
 
+    auto search_start = std::chrono::steady_clock::now();
     // Query the elements for themselves with filter and check returned labels
     int k = 10;
-    std::vector<hnswlib::labeltype> neighbors(max_elements * k);
-    ParallelFor(0, max_elements, num_threads, [&](size_t row, size_t threadId) {
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + dim * row, k, &pickIdsDivisibleByTwo);
+    int query_count = 100;
+    std::vector<hnswlib::labeltype> neighbors(query_count * k);
+    std::vector<float> scores(query_count * k);
+    ParallelFor(0, query_count, num_threads, [&](size_t row, size_t threadId) {
+//        std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + dim * row, k, &pickIdsDivisibleByTwo);
+        std::vector<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnnCloserFirst(data + row * dim, k, &pickIdsDivisibleByTwo);
+
         for (int i = 0; i < k; i++) {
-            hnswlib::labeltype label = result.top().second;
-            result.pop();
-            neighbors[row * k + i] = label;
+            auto index = row * k + i;
+            scores[index] = result.at(i).first;
+            neighbors[index] = result.at(i).second;
         }
     });
+    std::cout << "Search duration elapsed(ms)=" << since(search_start).count() << " queries:" << query_count << std::endl;
 
-    for (hnswlib::labeltype label: neighbors) {
-        if (label % 2 == 1) std::cout << "Error: found odd label\n";
+    for (int row = 0; row < query_count; row++) {
+        for (int i = 0; i < k; i++) {
+            auto index = row * k + i;
+            hnswlib::labeltype label = neighbors[index];
+            if (label % 2 == 1) {
+                std::cout << "Error: found odd label\n";
+            }
+            std::cout << label << ":" << scores[index] << ",";
+        }
+        std::cout << std::endl << "====" << std::endl;
+        if (row % 2 == 0) { // for odd id, and suitable ef value, it should be true:
+            if (row != neighbors[row * k]) {
+                std::cout << "incorrect for row:" << row << std::endl;
+            }
+            assert(row == neighbors[row * k]); // test the result
+        }
     }
+
 
     delete[] data;
     delete alg_hnsw;
